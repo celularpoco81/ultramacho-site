@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="light dark">
+<title>Acompanhar treino · Ultramacho</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#F6F4EE; --card:#FFFFFFEE; --text:#1A0605; --sub:#6B5A55; --accent:#BDD630; --warn:#D9531E; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14100F; --card:#241B19EE; --text:#F6F4EE; --sub:#B9ADA8; } }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+  #map { position: fixed; inset: 0; }
+  .card { position: fixed; left: 12px; right: 12px; bottom: 12px; z-index: 1000; background: var(--card); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-radius: 24px; padding: 16px 18px; box-shadow: 0 8px 30px rgba(0,0,0,.25); max-width: 520px; margin: 0 auto; }
+  .row { display: flex; align-items: center; gap: 10px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); flex: none; box-shadow: 0 0 0 4px rgba(189,214,48,.3); }
+  .dot.off { background: var(--sub); box-shadow: none; }
+  h1 { font-size: 20px; margin: 0; line-height: 1.2; }
+  .sub { color: var(--sub); font-size: 13px; margin-top: 4px; }
+  .brand { color: var(--sub); font-size: 11px; margin-top: 10px; letter-spacing: .4px; }
+  .ended { position: fixed; inset: 0; z-index: 900; display: none; align-items: center; justify-content: center; background: var(--bg); text-align: center; padding: 24px; }
+  .ended h2 { margin: 0 0 8px; font-size: 24px; }
+  body.over .ended { display: flex; }
+  body.over #map, body.over .card { visibility: hidden; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="card" id="card" role="status" aria-live="polite">
+  <div class="row"><span class="dot" id="dot"></span><h1 id="title">Carregando…</h1></div>
+  <div class="sub" id="sub"></div>
+  <div class="brand">ULTRAMACHO · localização ao vivo, só enquanto o treino durar</div>
+</div>
+<div class="ended"><div><h2>Treino encerrado</h2><div class="sub" id="endedSub">O compartilhamento de localização terminou.</div></div></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function () {
+  // Endereço da função (a página pode estar hospedada em outro lugar: o Supabase mostra HTML de função como texto puro).
+  var FN = 'https://ivmgxraaofmmxvdkuahn.supabase.co/functions/v1/acompanhar';
+  var token = new URLSearchParams(location.search).get('t') || '';
+  var map = L.map('map', { zoomControl: false }).setView([0, 0], 2);
+  L.control.zoom({ position: 'topright' }).addTo(map);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
+  var line = L.polyline([], { color: '#D9531E', weight: 5, opacity: .9 }).addTo(map);
+  var marker = null, halo = null, fitted = false, timer = null;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function ago(iso) {
+    if (!iso) return 'aguardando o primeiro sinal';
+    var s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+    if (s < 20) return 'agora';
+    if (s < 90) return 'há ' + s + ' s';
+    var m = Math.round(s / 60);
+    if (m < 60) return 'há ' + m + ' min';
+    return 'há ' + Math.floor(m / 60) + ' h ' + (m % 60) + ' min';
+  }
+  function hora(iso) { try { return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
+
+  function render(d) {
+    if (!d || d.erro || d.encerrado) {
+      document.body.className = 'over';
+      if (d && d.nome) $('endedSub').textContent = d.nome + ' terminou o treino. O compartilhamento de localização foi encerrado.';
+      if (d && d.erro) { document.querySelector('.ended h2').textContent = 'Link inválido'; $('endedSub').textContent = 'Este link não existe ou já expirou.'; }
+      if (timer) clearInterval(timer);
+      return;
+    }
+    $('title').textContent = d.nome + ' · ' + d.esporte;
+    var parts = ['Última atualização ' + ago(d.atualizado_em) + (d.atualizado_em ? ' (' + hora(d.atualizado_em) + ')' : '')];
+    if (d.velocidade_kmh != null) parts.push(String(d.velocidade_kmh).replace('.', ',') + ' km/h');
+    if (d.precisao != null) parts.push('precisão ±' + Math.round(d.precisao) + ' m');
+    $('sub').textContent = parts.join(' · ');
+    var stale = d.atualizado_em && Date.now() - new Date(d.atualizado_em).getTime() > 120000;
+    $('dot').className = 'dot' + (stale || !d.atualizado_em ? ' off' : '');
+    if (d.lat == null || d.lon == null) return;
+    var pos = [d.lat, d.lon];
+    var rota = (d.rota || []).slice();
+    line.setLatLngs(rota);
+    if (!marker) {
+      halo = L.circleMarker(pos, { radius: 20, stroke: false, fillColor: '#BDD630', fillOpacity: .3 }).addTo(map);
+      marker = L.circleMarker(pos, { radius: 9, color: '#3A1F1B', weight: 3, fillColor: '#BDD630', fillOpacity: 1 }).addTo(map);
+    } else { marker.setLatLng(pos); halo.setLatLng(pos); }
+    if (!fitted) { map.setView(pos, 16); fitted = true; }
+    else if (!map.getBounds().pad(-0.2).contains(pos)) map.panTo(pos);
+  }
+
+  function load() {
+    fetch(FN + '?t=' + encodeURIComponent(token) + '&json=1', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(render)
+      .catch(function () { $('sub').textContent = 'Sem conexão. Tentando de novo…'; });
+  }
+  load();
+  timer = setInterval(load, 15000);
+})();
+</script>
+</body>
+</html>
